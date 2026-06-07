@@ -24,16 +24,16 @@ For match-level team IDs, use `play1 near = team A` and `play1 far = team B`, th
 Default data root:
 
 ```bash
-/mnt/t/data/vball/skyball
+/mnt/t/data/vball/skyball/unified_dataset
 ```
 
 Expected annotations:
 
 ```bash
-/mnt/t/data/vball/skyball/annotations/v0/*_play*.json
+/mnt/t/data/vball/skyball/unified_dataset/annotations/v0/*_play*.json
 ```
 
-Generated crops and reports are written outside the repo under `/mnt/t/output/jersey_gallery/...`.
+Generated dataset galleries are written under `/mnt/t/data/vball/skyball/jersey/gallery/v0`.
 
 ## Run
 
@@ -78,3 +78,15 @@ Outputs:
 - `manifests/gallery_samples.jsonl`: selected crop metadata
 - `reports/summary.json`: counts and rejection reasons
 
+Build the split-organized gallery dataset:
+
+```bash
+python jersey_gallery.py \
+  --group-scope match \
+  --data-root /mnt/t/data/vball/skyball/unified_dataset \
+  --split-file /mnt/t/data/vball/skyball/unified_dataset/splits/v0.json \
+  --split-names train val \
+  --output /mnt/t/data/vball/skyball/jersey/gallery/v0
+```
+
+The sampler is deterministic for the same code, inputs, and options. The default seed is `20260606`; override it with `--seed`.

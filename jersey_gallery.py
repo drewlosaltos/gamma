@@ -193,6 +193,13 @@ def apply_jump_adjusted_y2(boxes: Iterable[PlayerBox]) -> list[PlayerBox]:
     ]
 
 
+def jaccard(left: set[str], right: set[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
 def assign_stable_team_ids(boxes: Iterable[PlayerBox]) -> list[PlayerBox]:
     by_match_video_side: dict[tuple[str, str, int], set[str]] = defaultdict(set)
     for box in boxes:
@@ -206,31 +213,46 @@ def assign_stable_team_ids(boxes: Iterable[PlayerBox]) -> list[PlayerBox]:
             by_match[match_id].append(video_id)
 
     for match_id, video_ids in by_match.items():
-        team_rosters = {"team0": set(), "team1": set()}
-        for idx, video_id in enumerate(sorted(video_ids)):
-            side1 = by_match_video_side.get((match_id, video_id, NEAR_SIDE_CATEGORY), set())
-            side2 = by_match_video_side.get((match_id, video_id, FAR_SIDE_CATEGORY), set())
-            if idx == 0:
-                assignments[(match_id, video_id, NEAR_SIDE_CATEGORY)] = "team0"
-                assignments[(match_id, video_id, FAR_SIDE_CATEGORY)] = "team1"
-                team_rosters["team0"].update(side1)
-                team_rosters["team1"].update(side2)
+        ordered_video_ids = sorted(video_ids)
+        if not ordered_video_ids:
+            continue
+
+        base_video_id = ordered_video_ids[0]
+        team_rosters = {
+            "A": set(by_match_video_side.get((match_id, base_video_id, NEAR_SIDE_CATEGORY), set())),
+            "B": set(by_match_video_side.get((match_id, base_video_id, FAR_SIDE_CATEGORY), set())),
+        }
+        base_overlap = team_rosters["A"] & team_rosters["B"]
+        base_is_ambiguous = len(base_overlap) >= 3 or jaccard(team_rosters["A"], team_rosters["B"]) >= 0.25
+        if not base_is_ambiguous:
+            assignments[(match_id, base_video_id, NEAR_SIDE_CATEGORY)] = "A"
+            assignments[(match_id, base_video_id, FAR_SIDE_CATEGORY)] = "B"
+
+        for video_id in ordered_video_ids[1:]:
+            near_roster = by_match_video_side.get((match_id, video_id, NEAR_SIDE_CATEGORY), set())
+            far_roster = by_match_video_side.get((match_id, video_id, FAR_SIDE_CATEGORY), set())
+            if base_is_ambiguous:
                 continue
 
-            no_swap = len(side1 & team_rosters["team0"]) + len(side2 & team_rosters["team1"])
-            swap = len(side1 & team_rosters["team1"]) + len(side2 & team_rosters["team0"])
-            if swap > no_swap:
-                near_team, far_team = "team1", "team0"
+            same = (jaccard(near_roster, team_rosters["A"]) + jaccard(far_roster, team_rosters["B"])) / 2.0
+            swap = (jaccard(near_roster, team_rosters["B"]) + jaccard(far_roster, team_rosters["A"])) / 2.0
+            if abs(same - swap) < 0.15:
+                continue
+            if swap > same:
+                near_team, far_team = "B", "A"
             else:
-                near_team, far_team = "team0", "team1"
+                near_team, far_team = "A", "B"
             assignments[(match_id, video_id, NEAR_SIDE_CATEGORY)] = near_team
             assignments[(match_id, video_id, FAR_SIDE_CATEGORY)] = far_team
-            team_rosters[near_team].update(side1)
-            team_rosters[far_team].update(side2)
+            team_rosters[near_team].update(near_roster)
+            team_rosters[far_team].update(far_roster)
 
     return [
         box.with_updates(
-            stable_team_id=assignments.get((box.match_id, box.video_id, box.category_id), box.team_side)
+            gallery_entity_id=box.match_id
+            if (box.match_id, box.video_id, box.category_id) in assignments
+            else box.video_id,
+            stable_team_id=assignments.get((box.match_id, box.video_id, box.category_id), box.team_side),
         )
         for box in boxes
     ]
@@ -495,15 +517,17 @@ def _quality_ranks(pool: list[PlayerBox]) -> dict[int, float]:
     }
 
 
-def select_diverse_candidates(group: list[PlayerBox], target_count: int, rng: random.Random) -> list[PlayerBox]:
-    acceptable = [box for box in group if is_acceptable_candidate(box)]
-    pool = acceptable or group
+def apply_area_floor(pool: list[PlayerBox], target_count: int) -> list[PlayerBox]:
     if len(pool) > target_count:
         areas = sorted(box.area for box in pool)
         median_area = areas[len(areas) // 2]
         larger_pool = [box for box in pool if box.area >= median_area]
         if len(larger_pool) >= target_count:
-            pool = larger_pool
+            return larger_pool
+    return pool
+
+
+def select_diverse_from_pool(pool: list[PlayerBox], target_count: int, rng: random.Random) -> list[PlayerBox]:
     if len(pool) <= target_count:
         return sorted(pool, key=lambda box: (box.play_id, box.frame_index, box.track_id))
 
@@ -534,6 +558,62 @@ def select_diverse_candidates(group: list[PlayerBox], target_count: int, rng: ra
             break
         selected.append(best)
         seen.add(best.ann_id)
+
+    return selected[:target_count]
+
+
+def play_quotas(pool: list[PlayerBox], target_count: int) -> dict[str, int]:
+    by_play: dict[str, list[PlayerBox]] = defaultdict(list)
+    for box in pool:
+        by_play[box.play_id].append(box)
+    plays = sorted(by_play)
+    if len(plays) <= 1:
+        return {plays[0]: min(target_count, len(by_play[plays[0]]))} if plays else {}
+
+    quotas = {play_id: min(len(by_play[play_id]), target_count // len(plays)) for play_id in plays}
+    remaining = target_count - sum(quotas.values())
+    while remaining > 0:
+        changed = False
+        for play_id in sorted(plays, key=lambda item: (-len(by_play[item]), item)):
+            if quotas[play_id] >= len(by_play[play_id]):
+                continue
+            quotas[play_id] += 1
+            remaining -= 1
+            changed = True
+            if remaining == 0:
+                break
+        if not changed:
+            break
+    return quotas
+
+
+def select_diverse_candidates(group: list[PlayerBox], target_count: int, rng: random.Random) -> list[PlayerBox]:
+    acceptable = [box for box in group if is_acceptable_candidate(box)]
+    pool = apply_area_floor(acceptable or group, target_count)
+    if len(pool) <= target_count:
+        return sorted(pool, key=lambda box: (box.play_id, box.frame_index, box.track_id))
+
+    quotas = play_quotas(pool, target_count)
+    if len(quotas) <= 1:
+        return select_diverse_from_pool(pool, target_count, rng)
+
+    by_play: dict[str, list[PlayerBox]] = defaultdict(list)
+    for box in pool:
+        by_play[box.play_id].append(box)
+
+    selected: list[PlayerBox] = []
+    seen: set[int] = set()
+    for play_id in sorted(quotas):
+        quota = quotas[play_id]
+        if quota <= 0:
+            continue
+        picks = select_diverse_from_pool(by_play[play_id], quota, rng)
+        selected.extend(picks)
+        seen.update(box.ann_id for box in picks)
+
+    if len(selected) < min(target_count, len(pool)):
+        remainder = [box for box in pool if box.ann_id not in seen]
+        selected.extend(select_diverse_from_pool(remainder, target_count - len(selected), rng))
 
     return selected[:target_count]
 
@@ -721,7 +801,7 @@ def write_unknown_grid(
 
 
 def first_train_matches(data_root: Path, count: int) -> list[str]:
-    split_path = data_root / "uber_datasets" / "v0.json"
+    split_path = data_root / "splits" / "v0.json"
     split = json.loads(split_path.read_text())
     matches: list[str] = []
     for video_id in split["train"]:
@@ -734,7 +814,7 @@ def first_train_matches(data_root: Path, count: int) -> list[str]:
 
 
 def first_train_videos(data_root: Path, count: int) -> list[str]:
-    split_path = data_root / "uber_datasets" / "v0.json"
+    split_path = data_root / "splits" / "v0.json"
     split = json.loads(split_path.read_text())
     return list(split["train"][:count])
 
@@ -758,7 +838,7 @@ def build_trial(
 
     if group_scope == "match":
         grouped_boxes = assign_stable_team_ids(all_boxes)
-        entity_ids = sorted({box.match_id for box in grouped_boxes})
+        entity_ids = sorted({box.gallery_entity_id or box.match_id for box in grouped_boxes})
     elif group_scope == "video":
         grouped_boxes = [
             box.with_updates(gallery_entity_id=box.video_id, stable_team_id=box.team_side)
@@ -838,13 +918,15 @@ def build_trial(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build volleyball player galleries.")
-    parser.add_argument("--data-root", default="/mnt/t/data/vball/skyball")
+    parser.add_argument("--data-root", default="/mnt/t/data/vball/skyball/unified_dataset")
     parser.add_argument("--output", default="/mnt/t/output/jersey_gallery/three_play_trial_001")
     parser.add_argument("--videos", nargs="*", default=None)
     parser.add_argument("--video-count", type=int, default=3)
     parser.add_argument("--group-scope", choices=["video", "match"], default="video")
     parser.add_argument("--matches", nargs="*", default=None)
     parser.add_argument("--match-count", type=int, default=2)
+    parser.add_argument("--split-file", default=None)
+    parser.add_argument("--split-names", nargs="*", default=None)
     parser.add_argument("--target-count", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20260606)
     parser.add_argument("--iou-threshold", type=float, default=0.40)
@@ -853,6 +935,28 @@ def main() -> None:
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
+    if args.split_file:
+        split_path = Path(args.split_file)
+        split = json.loads(split_path.read_text())
+        split_names = args.split_names or [name for name in split if name != "annotations"]
+        summaries = {}
+        for split_name in split_names:
+            video_ids = list(split[split_name])
+            summaries[split_name] = build_trial(
+                data_root=data_root,
+                output_dir=Path(args.output) / split_name,
+                video_ids=video_ids,
+                group_scope=args.group_scope,
+                target_count=args.target_count,
+                seed=args.seed,
+                iou_threshold=args.iou_threshold,
+                bbox_expand=args.bbox_expand,
+                jpeg_quality=args.jpeg_quality,
+            )
+        write_json(Path(args.output) / "summary.json", summaries)
+        print(json.dumps(summaries, indent=2, sort_keys=True))
+        return
+
     if args.videos:
         video_ids = args.videos
     elif args.matches:

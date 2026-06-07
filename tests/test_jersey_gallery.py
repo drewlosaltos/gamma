@@ -213,6 +213,30 @@ def test_stable_team_assignment_handles_side_switches() -> None:
     assert by_ann[1].stable_team_id == by_ann[7].stable_team_id
     assert by_ann[3].stable_team_id == by_ann[5].stable_team_id
     assert by_ann[1].stable_team_id != by_ann[3].stable_team_id
+    assert by_ann[1].stable_team_id == "A"
+    assert by_ann[3].stable_team_id == "B"
+    assert by_ann[5].gallery_entity_id == "m"
+
+
+def test_stable_team_assignment_keeps_high_overlap_match_play_local() -> None:
+    records = [
+        box(1, category_id=NEAR_SIDE_CATEGORY, jersey_number="1").with_updates(video_id="m_play1"),
+        box(2, category_id=NEAR_SIDE_CATEGORY, jersey_number="2").with_updates(video_id="m_play1"),
+        box(3, category_id=NEAR_SIDE_CATEGORY, jersey_number="3").with_updates(video_id="m_play1"),
+        box(4, category_id=FAR_SIDE_CATEGORY, jersey_number="1").with_updates(video_id="m_play1"),
+        box(5, category_id=FAR_SIDE_CATEGORY, jersey_number="2").with_updates(video_id="m_play1"),
+        box(6, category_id=FAR_SIDE_CATEGORY, jersey_number="3").with_updates(video_id="m_play1"),
+        box(7, category_id=NEAR_SIDE_CATEGORY, jersey_number="8").with_updates(video_id="m_play2"),
+        box(8, category_id=FAR_SIDE_CATEGORY, jersey_number="9").with_updates(video_id="m_play2"),
+    ]
+
+    assigned = assign_stable_team_ids(records)
+    by_ann = {item.ann_id: item for item in assigned}
+
+    assert by_ann[1].gallery_entity_id == "m_play1"
+    assert by_ann[1].stable_team_id == "near"
+    assert by_ann[4].stable_team_id == "far"
+    assert by_ann[7].gallery_entity_id == "m_play2"
 
 
 def test_video_scoped_identity_uses_video_and_side() -> None:
@@ -252,3 +276,25 @@ def test_sampling_spreads_single_play_track_over_time() -> None:
     assert min(frames) <= 10
     assert max(frames) >= 90
     assert len({frame // 10 for frame in frames}) >= 7
+
+
+def test_sampling_balances_available_match_plays() -> None:
+    import random
+    from collections import Counter
+
+    group = []
+    ann_id = 1
+    for play_id in ("play1", "play2", "play3"):
+        for frame_index in range(1, 31):
+            group.append(
+                box(ann_id, frame_index=frame_index, y=10 + frame_index, jersey_number="7").with_updates(
+                    play_id=play_id,
+                    video_id=f"m_{play_id}",
+                )
+            )
+            ann_id += 1
+
+    selected = select_diverse_candidates(group, 15, random.Random(123))
+    by_play = Counter(item.play_id for item in selected)
+
+    assert by_play == {"play1": 5, "play2": 5, "play3": 5}
